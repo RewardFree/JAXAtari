@@ -145,6 +145,10 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
             state_player_x <= self.consts.PLAYER_X_MIN, state_player_x >= player_x_max
         )
 
+        # The input changes the next frame's velocity; apply the stored
+        # velocity to this frame's position first.
+        player_x = jnp.clip(state_player_x + state_player_speed, self.consts.PLAYER_X_MIN, player_x_max)
+
         # Get the acceleration schedule based on whether the paddle is at a wall.
         # If touching a wall, use PLAYER_WALL_ACCELERATION, otherwise use PLAYER_ACCELERATION.
         acceleration = jax.lax.cond(
@@ -214,10 +218,6 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
             operand=acceleration_counter,
         )
 
-        # Update the paddle's horizontal position and clamp it within the game boundaries.
-        # player_x_max was already calculated at the beginning of this function
-        player_x = jnp.clip(state_player_x + player_speed, self.consts.PLAYER_X_MIN, player_x_max)
-
         return player_x, player_speed, new_acceleration_counter
 
     @partial(jax.jit, static_argnums=(0,))
@@ -270,10 +270,11 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
         return jnp.logical_or(jnp.logical_or(hit_from_above, hit_from_left), hit_from_right)
 
     @partial(jax.jit, static_argnums=(0,))
-    def _ball_step(self, state, game_started, player_x):
+    def _ball_step(self, state, player_x):
         """Updates the ball's position, handles wall collisions, and paddle bounces."""
         # Compute spawn index and spawn position
-        idx = state.step_counter % 4
+        # FIRE selects the next launch phase and displays its initial position.
+        idx = (state.step_counter + 1) % 4
         ball_start_x = self.consts.BALL_START_X[idx]
         ball_start_y = self.consts.BALL_START_Y
 
@@ -425,11 +426,10 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
             return (ball_x, ball_y, new_vel_x, new_vel_y, ball_speed_idx, ball_direction_idx,
                     new_consecutive_hits, blocks_hittable, small_paddle)
 
-        # Use a conditional: if game_started is true, run the normal update branch;
-        # otherwise, use the spawn values.
+        # A newly received FIRE starts movement on the following frame.
         (ball_x, ball_y, ball_vel_x, ball_vel_y, ball_speed_idx, ball_direction_idx,
          new_consecutive_hits, blocks_hittable, small_paddle) = jax.lax.cond(
-            game_started, started_fn, not_started_fn, operand=None
+            state.game_started, started_fn, not_started_fn, operand=None
         )
 
         return (ball_x, ball_y, ball_vel_x, ball_vel_y, ball_speed_idx, ball_direction_idx,
@@ -640,7 +640,7 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
         # Update ball, check collisions, etc., as before, but now pass new_player_x
         (ball_x, ball_y, ball_vel_x, ball_vel_y, ball_speed_idx, ball_direction_idx,
          consecutive_hits, blocks_hittable, small_paddle) = self._ball_step(
-            state, game_started, new_player_x
+            state, new_player_x
         )
 
         # Detect paddle hit (for resetting the wall)
@@ -667,7 +667,9 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
         )
 
         # Handle life loss, etc.
-        life_lost = ball_y >= self.consts.WINDOW_HEIGHT
+        # ALE checks the pre-movement position (RAM101 >= 208, screen y >= 217).
+        # Testing the updated y instead loses fast balls one frame too early.
+        life_lost = state.ball_y >= self.consts.WINDOW_HEIGHT + 7
         ball_x = jnp.where(life_lost, new_player_x + 7, ball_x)
         ball_y = jnp.where(life_lost, self.consts.BALL_START_Y, ball_y)
         ball_speed_idx = jnp.where(life_lost, 0, ball_speed_idx)
@@ -760,7 +762,8 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
 
     @partial(jax.jit, static_argnums=(0,))
     def _get_done(self, state: BreakoutState) -> chex.Array:
-        return jnp.logical_or(state.lives <= 0, state.all_blocks_cleared)
+        # ALE's game-over signal follows its lives counter, not wall clearance.
+        return state.lives <= 0
 
     def action_space(self) -> spaces.Discrete:
         """Returns the action space for Breakout.
@@ -1046,7 +1049,7 @@ class BreakoutRenderer(JAXGameRenderer):
         raster = self.jr.render_label_selective(raster, 36, 5,
                                     player_score_digits, self.SHAPE_MASKS['score_digits'],
                                     0, 3,
-                                    spacing=16)
+                                    spacing=16, max_digits_to_render=3)
 
         raster = self.jr.render_label_selective(raster, 100, 5,
                                     player_lifes_digit, self.SHAPE_MASKS['score_digits'],

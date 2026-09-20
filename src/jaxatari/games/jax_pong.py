@@ -258,6 +258,8 @@ class JaxPong(JaxEnvironment[PongState, PongObservation, PongInfo, PongConstants
             + jnp.sign(state.ball_vel_x),
             state.ball_vel_x,
         )
+        # ALE caps horizontal speed after FIRE/paddle acceleration too.
+        ball_vel_x = jnp.clip(ball_vel_x, -self.consts.BALL_MAX_SPEED, self.consts.BALL_MAX_SPEED)
 
         ball_vel_x = jnp.where(
             paddle_hit,

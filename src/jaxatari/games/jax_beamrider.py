@@ -588,33 +588,23 @@ class WhiteUFOUpdate:
 
 
 class JaxBeamrider(JaxEnvironment[BeamriderState, BeamriderObservation, BeamriderInfo, BeamriderConstants]):
+    # Use the same mutable instance override as AtariWrapper's full-action mode.
+    ACTION_SET = jnp.array(
+        [Action.NOOP, Action.FIRE, Action.UP, Action.RIGHT, Action.LEFT,
+         Action.UPRIGHT, Action.UPLEFT, Action.RIGHTFIRE, Action.LEFTFIRE],
+        dtype=jnp.int32,
+    )
+
+    @property
+    def action_set(self):
+        """Keep the legacy list view in sync with the active action mapping."""
+        return self.ACTION_SET.tolist()
+
     def __init__(self, consts: Optional[BeamriderConstants] = None):
         super().__init__(consts)
         self.consts = consts or BeamriderConstants()
         self.key = jax.random.PRNGKey(42067)
         self.renderer = BeamriderRenderer(self.consts)
-
-        self.action_set = [
-            Action.NOOP,
-            Action.FIRE,
-            Action.UP,
-            Action.RIGHT,
-            Action.LEFT,
-            Action.DOWN,
-            Action.UPRIGHT,
-            Action.UPLEFT,
-            Action.DOWNRIGHT,
-            Action.DOWNLEFT,
-            Action.UPFIRE,
-            Action.RIGHTFIRE,
-            Action.LEFTFIRE,
-            Action.DOWNFIRE,
-            Action.UPRIGHTFIRE,
-            Action.UPLEFTFIRE,
-            Action.DOWNRIGHTFIRE,
-            Action.DOWNLEFTFIRE,
-        ]
-        self._action_set_jnp = jnp.array(self.action_set, dtype=jnp.int32)
 
         # Pre-calculate static lane and physics data
         self.bottom_lanes = jnp.array(self.consts.BOTTOM_OF_LANES, dtype=jnp.float32)
@@ -1947,7 +1937,7 @@ class JaxBeamrider(JaxEnvironment[BeamriderState, BeamriderObservation, Beamride
     ) -> Tuple[BeamriderObservation, BeamriderState, float, bool, BeamriderInfo]:
 
         # Map action index to semantic value
-        action = jnp.take(self._action_set_jnp, action)
+        action = jnp.take(self.ACTION_SET, action)
 
         # --- 1. Advance Blue Lines (Always happens) ---
         line_positions, blue_line_counter, standby_accum = self._line_step(state)
@@ -3786,7 +3776,7 @@ class JaxBeamrider(JaxEnvironment[BeamriderState, BeamriderObservation, Beamride
 
         next_counter = counter + inc
 
-        is_init = next_counter < len(BLUE_LINE_INIT_TABLE)
+        is_init = counter < len(BLUE_LINE_INIT_TABLE)
 
         def get_init_pos(c):
             return BLUE_LINE_INIT_TABLE[jnp.minimum(c, len(BLUE_LINE_INIT_TABLE) - 1)]
@@ -3795,7 +3785,8 @@ class JaxBeamrider(JaxEnvironment[BeamriderState, BeamriderObservation, Beamride
             loop_idx = (c - len(BLUE_LINE_INIT_TABLE)) % len(BLUE_LINE_LOOP_TABLE)
             return BLUE_LINE_LOOP_TABLE[loop_idx]
 
-        positions = jax.lax.cond(is_init, get_init_pos, get_loop_pos, next_counter)
+        # The returned frame uses this phase; the increment is for the next step.
+        positions = jax.lax.cond(is_init, get_init_pos, get_loop_pos, counter)
 
         return positions, next_counter, next_accum
 
@@ -3966,7 +3957,7 @@ class JaxBeamrider(JaxEnvironment[BeamriderState, BeamriderObservation, Beamride
         return self.renderer.render(state)
 
     def action_space(self) -> spaces.Discrete:
-        return spaces.Discrete(len(self.action_set))
+        return spaces.Discrete(len(self.ACTION_SET))
 
     def _get_info(self, state: BeamriderState) -> BeamriderInfo:
         return BeamriderInfo(
@@ -4108,7 +4099,7 @@ class JaxBeamrider(JaxEnvironment[BeamriderState, BeamriderObservation, Beamride
         return new_pos, jnp.array([new_active]), new_player_shot_pos, jnp.array([destroyed]), jnp.array([hit_mask])
 
     def action_space(self) -> spaces.Discrete:
-        return spaces.Discrete(len(self.action_set))
+        return spaces.Discrete(len(self.ACTION_SET))
 
     def observation_space(self) -> spaces.Dict:
         return spaces.Dict({

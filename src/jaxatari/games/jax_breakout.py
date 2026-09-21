@@ -40,6 +40,9 @@ class BreakoutConstants(struct.PyTreeNode):
     # It will be computed as WINDOW_WIDTH - WALL_SIDE_WIDTH - max(PLAYER_SIZE[0], PLAYER_SIZE_SMALL[0])
     PLAYER_MAX_SPEED: int = struct.field(pytree_node=False, default=6)
     PLAYER_ACCELERATION: chex.Array = struct.field(pytree_node=False, default_factory=lambda: jnp.array([3, 2, -1, 1, 1]))
+    # ALE uses a mirrored first three acceleration phases for left movement.
+    # Keep the historical right-movement schedule above for compatibility.
+    PLAYER_LEFT_ACCELERATION: chex.Array = struct.field(pytree_node=False, default_factory=lambda: jnp.array([3, 1, 1, 1, 1]))
     PLAYER_WALL_ACCELERATION: chex.Array = struct.field(pytree_node=False, default_factory=lambda: jnp.array([1, 2, 1, 1, 1]))
     BLOCKS_PER_ROW: int = struct.field(pytree_node=False, default=18)
     NUM_ROWS: int = struct.field(pytree_node=False, default=6)
@@ -145,9 +148,13 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
             state_player_x <= self.consts.PLAYER_X_MIN, state_player_x >= player_x_max
         )
 
-        # The input changes the next frame's velocity; apply the stored
-        # velocity to this frame's position first.
-        player_x = jnp.clip(state_player_x + state_player_speed, self.consts.PLAYER_X_MIN, player_x_max)
+        # ALE applies the velocity stored from the previous frame, then updates
+        # velocity for the next frame from the current joystick input.
+        player_x = jnp.clip(
+            state_player_x + state_player_speed,
+            self.consts.PLAYER_X_MIN,
+            player_x_max,
+        )
 
         # Get the acceleration schedule based on whether the paddle is at a wall.
         # If touching a wall, use PLAYER_WALL_ACCELERATION, otherwise use PLAYER_ACCELERATION.
@@ -156,6 +163,11 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
             lambda _: self.consts.PLAYER_WALL_ACCELERATION[acceleration_counter],
             lambda _: self.consts.PLAYER_ACCELERATION[acceleration_counter],
             operand=None,
+        )
+        acceleration = jnp.where(
+            jnp.logical_and(left, jnp.logical_not(touches_wall)),
+            self.consts.PLAYER_LEFT_ACCELERATION[acceleration_counter],
+            acceleration,
         )
 
         # Apply deceleration if no button is pressed or if the paddle touches a wall.
@@ -273,7 +285,9 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
     def _ball_step(self, state, player_x):
         """Updates the ball's position, handles wall collisions, and paddle bounces."""
         # Compute spawn index and spawn position
-        # FIRE selects the next launch phase and displays its initial position.
+        # ALE advances the four launch variants while waiting for FIRE. The
+        # frame produced by FIRE itself uses the next variant but does not move
+        # the ball yet.
         idx = (state.step_counter + 1) % 4
         ball_start_x = self.consts.BALL_START_X[idx]
         ball_start_y = self.consts.BALL_START_Y
@@ -426,7 +440,8 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
             return (ball_x, ball_y, new_vel_x, new_vel_y, ball_speed_idx, ball_direction_idx,
                     new_consecutive_hits, blocks_hittable, small_paddle)
 
-        # A newly received FIRE starts movement on the following frame.
+        # The transition that receives FIRE still renders the launch position.
+        # Movement starts on the following frame, as it does in ALE.
         (ball_x, ball_y, ball_vel_x, ball_vel_y, ball_speed_idx, ball_direction_idx,
          new_consecutive_hits, blocks_hittable, small_paddle) = jax.lax.cond(
             state.game_started, started_fn, not_started_fn, operand=None
@@ -667,9 +682,13 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
         )
 
         # Handle life loss, etc.
-        # ALE checks the pre-movement position (RAM101 >= 208, screen y >= 217).
-        # Testing the updated y instead loses fast balls one frame too early.
-        life_lost = state.ball_y >= self.consts.WINDOW_HEIGHT + 7
+        # ALE lets the ball travel through the bottom status strip before
+        # registering a lost life; with the default sprites this is y == 218.
+        life_lost = ball_y >= (
+            self.consts.WINDOW_HEIGHT
+            + self.consts.BALL_SIZE[1]
+            + self.consts.PLAYER_SIZE[1]
+        )
         ball_x = jnp.where(life_lost, new_player_x + 7, ball_x)
         ball_y = jnp.where(life_lost, self.consts.BALL_START_Y, ball_y)
         ball_speed_idx = jnp.where(life_lost, 0, ball_speed_idx)
@@ -762,8 +781,11 @@ class JaxBreakout(JaxEnvironment[BreakoutState, BreakoutObservation, BreakoutInf
 
     @partial(jax.jit, static_argnums=(0,))
     def _get_done(self, state: BreakoutState) -> chex.Array:
-        # ALE's game-over signal follows its lives counter, not wall clearance.
-        return state.lives <= 0
+        cleared_second_wall = jnp.logical_and(
+            state.all_blocks_cleared,
+            state.wall_resets >= 1,
+        )
+        return jnp.logical_or(state.lives <= 0, cleared_second_wall)
 
     def action_space(self) -> spaces.Discrete:
         """Returns the action space for Breakout.
@@ -853,6 +875,64 @@ class BreakoutRenderer(JAXGameRenderer):
             self.COLOR_TO_ID,
             self.FLIP_OFFSETS
         ) = self.jr.load_and_setup_assets(asset_config, sprite_path)
+
+        # The shipped background asset contains a filled gray/purple playfield,
+        # while ALE renders a black playfield with only the top and side walls
+        # gray.  Build that static layer from the game geometry so pixel
+        # observations have the same visual layout as Breakout-v5.
+        black_id = self.COLOR_TO_ID[(0, 0, 0)]
+        wall_id = self.COLOR_TO_ID[self.consts.WALL_COLOR]
+        status_id = self.COLOR_TO_ID[(66, 158, 130)]
+        background = jnp.full_like(self.BACKGROUND, black_id)
+        top_end = self.consts.WALL_TOP_Y + self.consts.WALL_TOP_HEIGHT
+        background = background.at[self.consts.WALL_TOP_Y:top_end, :].set(wall_id)
+        # ALE ends the side walls at the paddle's top edge (y=189); its
+        # green status strip continues below the paddle until the black bar.
+        side_end = self.consts.PLAYER_START_Y
+        background = background.at[top_end:side_end, :self.consts.WALL_SIDE_WIDTH].set(wall_id)
+        background = background.at[top_end:side_end, -self.consts.WALL_SIDE_WIDTH:].set(wall_id)
+        status_end = self.consts.WINDOW_HEIGHT - 14
+        background = background.at[side_end:status_end, :self.consts.WALL_SIDE_WIDTH].set(status_id)
+        player_id = self.COLOR_TO_ID[self.consts.PLAYER_COLOR]
+        background = background.at[side_end:status_end - 1, -self.consts.WALL_SIDE_WIDTH:].set(player_id)
+        self.BACKGROUND = background
+
+        # The bundled digit sprites are solid rectangles, unlike ALE's
+        # seven-segment 4-pixel glyphs.  Rebuild the masks procedurally so
+        # score/lives pixels do not dominate the pixel observation mismatch.
+        transparent_id = self.jr.TRANSPARENT_ID
+        digit_masks = jnp.full((10, 10, 12), transparent_id, dtype=jnp.uint8)
+        segments = {
+            "top": (slice(0, 2), slice(0, 12)),
+            "upper_left": (slice(2, 6), slice(0, 4)),
+            "upper_right": (slice(2, 6), slice(8, 12)),
+            "middle": (slice(4, 6), slice(0, 12)),
+            "lower_left": (slice(4, 8), slice(0, 4)),
+            "lower_right": (slice(4, 8), slice(8, 12)),
+            "bottom": (slice(8, 10), slice(0, 12)),
+        }
+        digit_segments = (
+            ("top", "upper_left", "upper_right", "lower_left", "lower_right", "bottom"),
+            ("upper_right", "lower_right"),
+            ("top", "upper_right", "middle", "lower_left", "bottom"),
+            ("top", "upper_right", "middle", "lower_right", "bottom"),
+            ("upper_left", "upper_right", "middle", "lower_right"),
+            ("top", "upper_left", "middle", "lower_right", "bottom"),
+            ("top", "upper_left", "middle", "lower_left", "lower_right", "bottom"),
+            ("top", "upper_right", "lower_right"),
+            ("top", "upper_left", "upper_right", "middle", "lower_left", "lower_right", "bottom"),
+            ("top", "upper_left", "upper_right", "middle", "lower_right", "bottom"),
+        )
+        for digit, names in enumerate(digit_segments):
+            visible = jnp.zeros((10, 12), dtype=jnp.bool_)
+            for name in names:
+                visible = visible.at[segments[name]].set(True)
+            digit_masks = digit_masks.at[digit].set(
+                jnp.where(visible, wall_id, transparent_id)
+            )
+        one_mask = jnp.full((10, 12), transparent_id, dtype=jnp.uint8)
+        one_mask = one_mask.at[:, 4:8].set(wall_id)
+        self.SHAPE_MASKS["score_digits"] = digit_masks.at[1].set(one_mask)
 
         PALETTE_ID_BLACK = 0 # in this case 0 is black which is the background color. In other cases this might need to be adjusted.
         self.COLOR_MAP = jnp.array([
@@ -983,6 +1063,7 @@ class BreakoutRenderer(JAXGameRenderer):
 
         result = {
             'block_colors': block_sprites,
+            'status_strip': jnp.array([[[66, 158, 130, 255]]], dtype=jnp.uint8),
             'bottom_bar': bottom_bar_sprite
         }
         
@@ -1004,6 +1085,7 @@ class BreakoutRenderer(JAXGameRenderer):
         asset_config = list(self.consts.ASSET_CONFIG)
         asset_config.extend([
             {'name': 'block_colors', 'type': 'procedural', 'data': procedural_sprites['block_colors']},
+            {'name': 'status_strip', 'type': 'procedural', 'data': procedural_sprites['status_strip']},
             {'name': 'bottom_bar', 'type': 'procedural', 'data': procedural_sprites['bottom_bar']},
         ])
         if 'player' in procedural_sprites:
@@ -1049,7 +1131,8 @@ class BreakoutRenderer(JAXGameRenderer):
         raster = self.jr.render_label_selective(raster, 36, 5,
                                     player_score_digits, self.SHAPE_MASKS['score_digits'],
                                     0, 3,
-                                    spacing=16, max_digits_to_render=3)
+                                    spacing=16,
+                                    max_digits_to_render=3)
 
         raster = self.jr.render_label_selective(raster, 100, 5,
                                     player_lifes_digit, self.SHAPE_MASKS['score_digits'],
